@@ -1,0 +1,1971 @@
+#!/usr/bin/env python
+'''Download programmes from the Australian TV web sites (only ABC and SBS so far).'''
+
+import sys
+if '--cron' not in sys.argv[1:]:
+  sys.stdout.write('Loading... ')
+  sys.stdout.flush()
+
+import os
+import re
+import tty
+import fcntl
+import signal
+import pickle
+import struct
+import decimal
+import termios
+import fnmatch
+import termios
+import os.path
+import datetime
+import textwrap
+import subprocess
+import ConfigParser
+import htmlentitydefs
+from itertools import izip_longest
+from xml.etree import cElementTree
+
+__version__ = '0.22'
+__date__ = 'March 2011'
+__licence__ = 'public domain'
+
+app_name = os.path.basename(os.path.realpath(__file__))
+base_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(base_dir)
+os.chdir(base_dir)
+
+import httplib2
+from dialog import Dialog
+
+try:
+  import json
+except:
+  import simplejson as json
+
+
+class config:
+  # command line
+  debug = False
+  ignore_cache = False
+  clear_cache = False
+  cron = False
+  # rc: general options
+  use_queue = False
+  automation_use_queue = True
+  sort_order = 'date'
+  # rc: external commands
+  dialog_cmd = './dialog'
+  rtmpdump_cmd = './rtmpdump'
+  curl_cmd = 'curl'
+  wget_cmd = 'wget'
+  # rc: files and directories used
+  download_dir = '~/Downloads'
+  cache_dir = '/var/tmp'
+  already_downloaded_file = './downloaded.txt'
+  automation_file = './automation.txt'
+  queue_file = './queue.pickle'
+  # rc: cron
+  cron_use_email = False
+  cron_email_recipient = ''
+  cron_use_growl = False
+  cron_use_console = False
+  # rc: ABC
+  abc_url = 'http://www.abc.net.au/iview'
+  abc_last_fetch = None
+  abc_fetch_limit = '64'
+  # rc: SBS
+  sbs_url = 'http://player.sbs.com.au'
+  # internal (not user settable)
+  rc = None
+  rc_file = './settings.ini'
+  tty_settings = None
+  automation_rules = []
+  automation_matches = []
+  search_help = 'Searches are case-insensitive:\n' + \
+      '  \Zb\Z4*\Zn matches everything\n' + \
+      '  \Zb\Z4?\Zn matches any single character\n' + \
+      '  \Zb\Z4[s]\Zn matches any character in \Zb\Z4s\Zn\n' + \
+      '  \Zb\Z4[!s]\Zn matches any character not in \Zb\Z4s\Zn\n'
+  progress_running = False
+  downloaded = {}
+  queue = []
+
+
+class ABC():
+  '''ABC iView metadata
+
+    Data structures: category|playlist|series|programme
+      category{
+        key:    str (eg 'arts')
+        value:  dict(title=str, parent=key, genre=boolean, categories=[key])
+      }
+      playlist{
+        key:    str (eg 'index', 'arts', '3024957' (series))
+        value:  dict(title=str, series=[key])
+      }
+      series{
+        key:    str (eg '3024957')
+        value:  dict(title=str, keywords=str, programmes=[key)])
+      }
+      programme{
+        key:    str (eg '658460')
+        value:  dict(series_title=str, title=str, subtitle=str, desc=str,
+                     expires=datetime, size=int, duration=int, rating=str, filename=str)
+      }
+
+    Source data: seriesIndex (json)|series (json)|categories (xml)
+      seriesIndex[
+        a: id
+        b: title
+        d: image URL
+        e: keywords
+        f: [programme] (only elements a, f, g)
+      ]
+      series[
+        a: id
+        b: title
+        d: image URL
+        e: keywords
+        f: [programme]
+      ]
+      programme
+        a: id
+        b: title
+        c: subtitle (optional)
+        d: description
+        e: category_title
+        f: transmission date/time?
+        g: expiry date/time
+        h: date/time?
+        i: size in MB (optional)
+        j: length in seconds (optional)
+        m: rating (optional)
+        n: filename
+        s: image URL
+      categories[
+        category:
+            id
+            name
+            index (optional, not used)
+            genre (optional)
+            [category] (optional)
+      ]
+
+  '''
+
+  def __init__(self):
+    self.config_url = config.abc_url + '/xml/config.xml'
+    self.auth_swf = 'http://www.abc.net.au/iview/images/iview.jpg'  # really a swf, despite its name
+    self.category = {}
+    self.playlist = {}
+    self.series = {}
+    self.programme = {}
+    self._get_config()
+    self._get_categories()
+    self._get_playlists()
+    self.get_auth()
+    self.all_programmes = [p for p in self.programme]
+
+  def get_auth(self):
+    '''get auth info'''
+    xml = cElementTree.XML(http(self.auth_url)[1])
+    self.series_namespace = xml.tag[1:].split("}")[0]
+    self.server_url = xml.find('{%s}server' % self.series_namespace).text
+    self.token = xml.find('{%s}token' % self.series_namespace).text
+    self.downloads_are_metered = xml.find('{%s}free' % self.series_namespace).text != 'yes'
+    self.hosting_service = xml.find('{%s}host' % self.series_namespace).text
+
+  def _get_config(self):
+    '''get config info'''
+    config_xml = cElementTree.XML(http(self.config_url)[1])
+    self.api_url = [a.get('value') for a in config_xml.findall('param') if a.get('name') == 'api'][0]
+    self.auth_url = [a.get('value') for a in config_xml.findall('param') if a.get('name') == 'auth'][0]
+    self.categories_url = config.abc_url + '/' + [
+        a.get('value') for a in config_xml.findall('param') if a.get('name') == 'categories'][0]
+    self.streaming_url = [a.get('value') for a in config_xml.findall('param') if a.get('name') == 'server_streaming'][0]
+
+  def _get_categories(self):
+    '''get categories'''
+    xml = cElementTree.XML(http(self.categories_url)[1])
+    assert(len(xml) > 0)
+    for c in xml.findall('category'):
+      self.category[c.get('id')] = dict(
+          title=c.find('name').text,
+          parent=None,
+          genre='genre' in c.keys(),
+          categories=[s.get('id') for s in c.findall('category')])
+      for s in c.findall('category'):
+        self.category[s.get('id')] = dict(
+            title=s.find('name').text,
+            parent=c.get('id'),
+            genre='genre' in s.keys(),
+            categories=[])
+
+  def _get_playlists(self):
+    '''get most of the playlists (not the ones by keyword)'''
+    try:
+      j = json.loads(http(self.api_url + 'seriesIndex')[1])  # seriesIndex
+    except ValueError:
+      app_error('Cannot decode JSON from %s' % (self.api_url + 'seriesIndex'))
+    all_series = [s['a'] for s in j]
+    percent = 100.0 / (len(all_series) / float(config.abc_fetch_limit))
+    for i, group in enumerate(grouper(config.abc_fetch_limit, all_series)):
+      query = 'series=' + ','.join([s for s in group if s])
+      try:
+        self._load_series(json.loads(http(self.api_url + query)[1]))
+      except ValueError:
+        app_error('Cannot decode JSON from %s' % (self.api_url + query))
+      for s in self.series:  # create playlist for each series
+        self.playlist[s] = dict(title=self.series[s]['title'], series=[s])
+      if 'ui' in globals():
+        ui_progress('Fetching \Z4\ZbABC\Zn data...', (i - 1) * percent)
+    self.playlist['index'] = dict(title='Series', series=[s for s in self.playlist])  # create playlist index
+
+  def _load_series(self, j):
+    '''load series[] and programme[] from iview json'''
+    for s in j:
+      series_title = unescape(s['b'])
+      self.series[s['a']] = dict(  # add series for playlist
+          title=series_title,
+          keywords=unescape(s['e']),
+          programmes=[p['a'] for p in s['f']])
+      for p in s['f']:  # add programmes
+        assert('n' in p)
+        programme_title = unescape(p['b'])
+        if programme_title != series_title:
+          programme_title = series_title + ' - ' + programme_title
+        self.programme[p['a']] = dict(
+            title=programme_title,
+            subtitle=unescape(p['c']) if 'c' in p else '',
+            desc=unescape(p['d']),
+            added=datetime.datetime.strptime(p['f'], '%Y-%m-%d %H:%M:%S'),
+            expires=datetime.datetime.strptime(p['g'], '%Y-%m-%d %H:%M:%S'),
+            size=bytes(float(p['i']) * 1024 * 1024) if 'i' in p else None,
+            duration=int(p['j']) if 'j' in p else None,
+            rating=p['m'] if 'm' in p else None,
+            image_url=p['r'] if 'r' in p else None,
+            website=unescape(p['l']) if 'l' in p else None,
+            filename=p['n'])
+
+  def get_playlist(self, keyword):
+    '''get playlist for keyword'''
+    if keyword in self.playlist:
+      return
+    try:
+     j = json.loads(http(self.api_url + 'keyword=' + keyword)[1])
+    except ValueError:
+      app_error('Cannot decode JSON from %s' % (self.api_url + 'seriesIndex'))
+    self.playlist[keyword] = dict(
+        title=self.category[keyword]['title'],
+        series=[s['a'] for s in j])
+
+
+class SBS():
+  '''SBS metadata
+
+    Data structures: menu|playlist
+      menu{
+        key:    menuid (eg '137')
+        value:  dict(title=str, parent=key, menus=[key], playlist=str)
+      }
+      playlist{
+        key: str (eg 'video/playlist/index/standalone/95')
+        value: dict(programme, source, title, description, duration, date)
+      }
+
+  '''
+
+  def __init__(self):
+    self._get_config()
+    self.menu = {}
+    self._get_menus()
+    self.playlist = {}
+    self.all_programmes = {}  # only fully populated one all playlists are fetched
+
+  def _get_config(self):
+    '''get config info'''
+    self.config_url = config.sbs_url + '/playerassets/programs/standalone_settings.xml'
+    xml = cElementTree.XML(http(self.config_url)[1])
+    self.menu_url = config.sbs_url + [a.get('value') for a in xml.findall('setting') if a.get('name') == 'menuURL'][0]
+
+  def _get_menus(self):
+    '''get menu'''
+    xml = cElementTree.XML(http(self.menu_url)[1])
+    self.root_menu = xml.get('id')
+    self._build_menus(xml, '', 'SBS')
+
+  def _build_menus(self, xml, parent, title):
+    n = {}
+    mid = xml.get('id')
+    n['parent'] = parent
+    n['title'] = title
+    for m in xml.findall('menu'):
+      self._build_menus(m, mid, m.find('title').text)
+    n['menus'] = [m.get('id') for m in xml.findall('menu')]
+    playlist = xml.find('playlist')
+    if playlist != None: n['playlist'] = playlist.get('xmlSrc')
+    self.menu[mid] = n
+
+  def get_playlist(self, id):
+    if id in self.playlist:
+      return
+    self.playlist[id] = []
+    xml = cElementTree.XML(http(config.sbs_url + id)[1])
+    for v in xml.findall('video'):
+      n = {}
+      n['programme'] = v.get('id')
+      n['source'] = v.get('src')
+      n['title'] = v.find('title').text
+      d = v.find('description').text
+      n['description'] = '' if d == None else d
+      n['duration'] = int(v.find('duration').text) / 1000
+      try:
+        n['date'] = datetime.datetime.fromtimestamp(int(v.find('date').text) / 1000)
+      except ValueError:
+        pass
+      self.playlist[id].append(n)
+      self.all_programmes[n['programme']] = n
+
+
+def app_init():
+  '''ensure some basics so we can proceed'''
+  signal.signal(signal.SIGINT, shutdown)
+  get_config()
+  update_config()
+  clear_http_cache(days=0 if config.clear_cache else 30)
+  read_downloaded()
+  automation_load_rules()
+  load_queue()
+
+
+def usage():
+  sys.exit(textwrap.dedent ('''\
+    \r%s: %s
+    v%s, %s, %s
+
+    Usage:
+      %s [options]
+
+    Options:
+      -?, -h, --help   Print this short help message and exit.
+      --ignorecache    Bypass the HTTP cache.
+      --clearcache     Clear the entire HTTP cache (normally the last 30 days are kept).
+      --cron           download automation results and download queue.
+      --check          check automation results and download queue.
+    ''' % (app_name, __doc__, __version__, __date__, __licence__, app_name)))
+
+
+def grouper(n, iterable, fillvalue=None):
+    args = [iter(iterable)] * n
+    return izip_longest(fillvalue=fillvalue, *args)
+
+
+def get_config():
+  '''get configuration from command line and the startup (rc) file'''
+  # command line settings
+  args = sys.argv[1:]
+  config.debug  = '--debug' in args or '-d' in args
+  if config.debug: print 'debug mode'
+  config.ignore_cache = '--ignorecache' in args
+  config.clear_cache = '--clearcache' in args
+  config.cron = '--cron' in args
+  config.cron_check = '--check' in args
+  if any(o in args for o in ('-?', '-h', '--help')):
+    usage()
+
+  # rc file settings
+  rc = ConfigParser.SafeConfigParser()
+  rc.read(config.rc_file)
+  if not rc.has_section('options'): rc.add_section('options')
+  if not rc.has_section('commands'): rc.add_section('commands')
+  if not rc.has_section('directories'): rc.add_section('directories')
+  if not rc.has_section('files'): rc.add_section('files')
+  if not rc.has_section('cron'): rc.add_section('cron')
+  if not rc.has_section('abc'): rc.add_section('abc')
+  if not rc.has_section('sbs'): rc.add_section('sbs')
+  try: config.sort_order = rc.get('options', 'sort')
+  except: rc.set('options', 'sort', config.sort_order)
+  try: config.use_queue = rc.getboolean('options', 'queue')
+  except: rc.set('options', 'queue', str(config.use_queue))
+  try: config.automation_use_queue = rc.getboolean('options', 'automation_downloads_queue')
+  except: rc.set('options', 'automation_downloads_queue', str(config.automation_use_queue))
+  try: config.dialog_cmd = rc.get('commands', 'dialog')
+  except: rc.set('commands', 'dialog', config.dialog_cmd)
+  try: config.rtmpdump_cmd = rc.get('commands', 'rtmpdump')
+  except: rc.set('commands', 'rtmpdump', config.rtmpdump_cmd)
+  try: config.curl_cmd = rc.get('commands', 'curl')
+  except: rc.set('commands', 'curl', config.curl_cmd)
+  try: config.wget_cmd = rc.get('commands', 'wget')
+  except: rc.set('commands', 'wget', config.wget_cmd)
+  try: config.download_dir = rc.get('directories', 'download')
+  except: rc.set('directories', 'download', config.download_dir)
+  try: config.cache_dir = rc.get('directories', 'http_cache')
+  except: rc.set('directories', 'http_cache', config.cache_dir)
+  try: config.queue_file = rc.get('files', 'queue')
+  except: rc.set('files', 'queue', config.queue_file)
+  try: config.already_downloaded_file = rc.get('files', 'downloaded')
+  except: rc.set('files', 'downloaded', config.already_downloaded_file)
+  try: config.automation_file = rc.get('files', 'automation')
+  except: rc.set('files', 'automation', config.automation_file)
+  try: config.cron_use_email = rc.getboolean('cron', 'use_email')
+  except: rc.set('cron', 'use_email', str(config.cron_use_email))
+  try: config.cron_email_recipient = rc.get('cron', 'email_recipient')
+  except: rc.set('cron', 'email_recipient', config.cron_email_recipient)
+  try: config.cron_use_growl = rc.getboolean('cron', 'use_growl')
+  except: rc.set('cron', 'use_growl', str(config.cron_use_growl))
+  try: config.cron_use_console = rc.getboolean('cron', 'use_console')
+  except: rc.set('cron', 'use_console', str(config.cron_use_console))
+  try: config.abc_url = rc.get('abc', 'abc_url')
+  except: rc.set('abc', 'url', config.abc_url)
+  try: config.abc_fetch_limit = rc.get('abc', 'fetch_limit')
+  except: rc.set('abc', 'fetch_limit', config.abc_fetch_limit)
+  try: config.sbs_url = rc.get('sbs', 'sbs_url')
+  except: rc.set('sbs', 'url', config.sbs_url)
+  if not os.path.exists(config.rc_file):  # first time run
+    f = open(config.rc_file, 'wb')
+    rc.write(f)
+    f.close()
+    sys.stdout.write('\rFirst time run.\n')
+    sys.stdout.write('A startup file has been created in %s\n' % config.rc_file)
+    sys.stdout.write('Edit this file with the correct values if needed and run again.\n')
+    shutdown(0, None)
+
+  if config.sort_order not in ['date', 'title']:
+    app_error('invalid sort in config (must be "date" or "title"): %s' % config.sort_order)
+
+  config.dialog_cmd = get_command_path(config.dialog_cmd)
+  if not (os.path.exists(config.dialog_cmd) and os.access(config.dialog_cmd, os.X_OK)):
+    app_error('dialog command is not an executable file: %s' % config.dialog_cmd)
+
+  config.rtmpdump_cmd = get_command_path(config.rtmpdump_cmd)
+  if not (os.path.exists(config.rtmpdump_cmd) and os.access(config.rtmpdump_cmd, os.X_OK)):
+    app_error('rtmpdump command is not an executable file: %s' % config.rtmpdump_cmd)
+
+  if config.curl_cmd: config.curl_cmd = get_command_path(config.curl_cmd)
+
+  if config.wget_cmd: config.wget_cmd = get_command_path(config.wget_cmd)
+
+  config.download_dir = fix_path(config.download_dir)
+  f = os.path.join(config.download_dir, app_name + '_test')
+  try: open(f, 'w').write('ok')
+  except IOError: app_error('cannot write to download directory: %s' % config.download_dir)
+  os.unlink(f)
+
+  config.cache_dir = os.path.join(fix_path(config.cache_dir), app_name)
+  if not os.path.exists(config.cache_dir):
+    try: os.makedirs(config.cache_dir)
+    except IOError: app_error('cannot create cache directory: %s' % config.cache_dir)
+  f = os.path.join(config.cache_dir, app_name + '_test')
+  try: open(f, 'w').write('ok')
+  except IOError: app_error('cannot write to cache directory: %s' % confif.cache_dir)
+  os.unlink(f)
+
+  config.queue_file = fix_path(config.queue_file)
+
+  config.already_downloaded_file = fix_path(config.already_downloaded_file)
+
+  config.automation_file = fix_path(config.automation_file)
+
+  if config.cron_use_growl:
+    if not which('growlnotify'): app_error('cannot set growl in config, growlnotify command not found')
+
+  if config.abc_url.endswith('/'): config.abc_url = config.abc_url[:-1]
+
+  try: config.abc_last_fetch = rc.get('abc', 'last_fetch')
+  except: pass
+  if config.abc_last_fetch:
+    try: config.abc_last_fetch = datetime.datetime.strptime(config.abc_last_fetch, '%Y-%m-%d %H:%M')
+    except: app_error('bad date for abc last_fetch in config: %s' % config.abc_last_fectch)
+  else:
+    config.abc_last_fetch = datetime.datetime.now() - datetime.timedelta(days=366)
+    rc.set('abc', 'last_fetch', config.abc_last_fetch.strftime('%Y-%m-%d %H:%M'))
+
+  try: config.abc_fetch_limit = int(config.abc_fetch_limit)
+  except: app_error('invalid integer for abc fetch_limit in config')
+  if config.abc_fetch_limit > 64 or config.abc_fetch_limit < 1:
+    app_error('value for abc fetch_lmit in config should be between 1 and 64')
+
+  if config.sbs_url.endswith('/'): config.sbs_url = config.sbs_url[:-1]
+
+  config.rc = rc
+
+
+def update_config():
+  f = open(config.rc_file, 'wb')
+  config.rc.write(f)
+  f.close()
+
+
+def shutdown(sig, stack):
+  '''clean up and exit (possible in response to signal, eg ctrl-c)'''
+  if config.tty_settings:
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, config.tty_settings)  # restore terminal settings
+    print
+    if not sig:
+      print 'Quit'
+  sys.exit(sig)
+
+
+def app_error(s):
+  '''print an error and quit'''
+  sys.stdout.write('\rError: %s\n' % s)
+  shutdown(1, None)
+
+
+def read_downloaded():
+  config.downloaded = {}
+  if os.path.exists(config.already_downloaded_file):
+    f = open(config.already_downloaded_file, 'r')
+    successfuls = f.read().split('\n')
+    f.close()
+    for field in [line.strip().split() for line in successfuls if line]:
+      if field[0][-4:] not in ['.mp4', '.flv']:
+        app_error('invalid filename (%s) in downloaded list (%s)' % (field[0], config.already_downloaded_file))
+      if len(field) == 2:
+        config.downloaded[field[0]] = datetime.datetime.strptime(field[1] + ' ' + field[2], '%Y-%m-%d %H:%M')
+      else:
+        config.downloaded[field[0]] = None
+
+
+def fix_path(path):
+  return os.path.realpath(os.path.expanduser(os.path.normpath(path)))
+
+
+def get_command_path(command):
+  if os.path.dirname(command): return fix_path(command)
+  return which(command)
+
+
+def bytes(n):
+  '''human readable bytes (multiples of 1024). Eg. 5B, 2.10KB, 4.21GB'''
+  n = float(n)
+  for p in range(6):
+    r = n / pow(1024, p)
+    if n < pow(1024, p + 1):
+      break
+  s = str(decimal.Decimal(str(r)).quantize(decimal.Decimal('0.01')))
+  if s.endswith('.00'):
+    s = s[:-3]
+  return re.sub(r'(\d{3})(?=\d)', r'\1,', s[::-1])[::-1] + ([''] + list('KMGTP'))[p] + 'B'
+
+
+def human_datetime(d):
+  return datetime.datetime.strftime(d, '%A, %%d %B %Y at %I:%M %p') % d.day
+
+
+def runtime(duration):
+  '''human readable runtime (eg 1 hour, 20 minutes) from minutes'''
+  try:
+    duration = int(duration)
+  except ValueError:
+    return '0 seconds'
+  if duration < 1:
+    return '0 seconds'
+  seconds = duration % 60
+  minutes = duration / 60
+  hours = minutes / 60
+  minutes = minutes % 60
+  h = '' if hours == 0 else ('1 hour' if hours == 1 else '%s hours' % '{:,}'.format(hours))
+  m = '' if minutes == 0 else ('1 minute' if minutes == 1 else '%d minutes' % minutes)
+  s = '' if seconds == 0 else ('1 second' if seconds == 1 else '%d seconds' % seconds)
+  return ', '.join([i for i in [h, m, s] if i])
+
+
+def which(program):
+  '''mimic unix "which" command'''
+  def is_exe(fpath):
+    return os.path.exists(fpath) and os.access(fpath, os.X_OK)
+
+  fpath, fname = os.path.split(program)
+  if fpath:
+    if is_exe(program):
+      return program
+  else:
+    for path in os.environ["PATH"].split(os.pathsep):
+      exe_file = os.path.join(path, program)
+      if is_exe(exe_file):
+        return exe_file
+  return None
+
+
+def natural_order(s):
+  '''a more natural sort order for English titles
+     - ignore "the " and "a " at the start of titles
+     - digits in numerical order: " 1" < "10"
+
+  '''
+  s = s.lower()
+  s = s[4:] if s.startswith('the ') else (s[2:] if s.startswith('a ') else s)
+  return [int(p) if p.isdigit() else p for p in re.split(r'(\d+)', s)]
+
+
+def http(url, timeout=15):
+  '''fetch resource via http with caching'''
+  # httplib2.debuglevel = 0  # 0 .. ?
+  headers = {'user-agent': '%s_v%s' % (app_name, __version__)}
+  if config.ignore_cache:
+    headers['cache-control'] = 'no-cache'
+  try:
+    h = httplib2.Http(config.cache_dir)
+    return_code, data = h.request(url, headers=headers)
+  except:
+    text = '\Zb\Z1Error\Zn\n\n'
+    text += 'Cannot fetch resource:\n'
+    text += '  ' + url
+    height, width = ui_dimensions(text)
+    ui.msgbox(text, height=height, width=width, ok_label='Exit')
+    shutdown(1, None)
+  return return_code, data
+
+
+def clear_http_cache(days=30):
+  '''clear the http cache (here be dragons)'''
+  oldest = datetime.datetime.now() - datetime.timedelta(days=days)
+  for f in os.listdir(config.cache_dir):
+    fn = os.path.join(config.cache_dir, f)
+    if datetime.datetime.fromtimestamp(os.path.getmtime(fn)) <= oldest:
+      os.unlink(fn)
+
+
+def unescape(text):
+  '''convert (unescape) html entities to unicode
+     credit: http://effbot.org/zone/re-sub.htm#unescape-html
+
+  '''
+  def fixup(m):
+    text = m.group(0)
+    if text[:2] == "&#":  # character reference
+      try:
+        if text[:3] == "&#x":
+          return unichr(int(text[3:-1], 16))
+        else:
+          return unichr(int(text[2:-1]))
+      except ValueError:
+        pass
+    else:  # named entity
+      try:
+        text = unichr(htmlentitydefs.name2codepoint[text[1:-1]])
+      except KeyError:
+        pass
+    return text  # leave as is
+
+  return re.sub("&#?\w+;", fixup, text)
+
+
+def ui_init():
+  global rows, cols, ui
+  config.tty_settings = termios.tcgetattr(sys.stdin.fileno())  # save terminal settings in case of ugly exit
+  rows, cols = struct.unpack('hh', fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, '0000'))  # screen size
+  row = int(rows / 100.0 * 80)  # use 80% of available screen
+  cols = int(cols / 100.0 * 80)
+  ui = Dialog(dialog=config.dialog_cmd)
+  ui.add_persistent_args(['--backtitle', '%s v%s' % (app_name, __version__), '--no-lines', '--no-shadow', '--colors'])
+
+
+def ui_menus(title, items, on_selection, sort=True, exit_button=False, back=False, default=None):
+  '''show a menu and submenus'''
+  # items = [(name, title), ...]
+  # performs on_selection
+  # returns keycode
+  if len(items) < 1:
+    text = '%s\Zn\n\n\n\Z1Nothing found.\Zn' % title
+    height, width = ui_dimensions(text)
+    return ui.msgbox(text, height=height, width=width)
+  if sort:
+    items.sort(key=lambda k: natural_order(k[1]))
+  choice = None
+  choices = [(str(i[0] + 1), i[1][1]) for i in enumerate(items)]
+  text = '\Zb\Z4%s\Zn' % title
+  height = min(rows - 10, len(choices))
+  width = min(cols, max(max(len(x[1]) + 20 for x in choices), len(title)))
+  while True:
+    choice = choices[[c[0] for c in choices].index(choice)][0] if choice else '1'
+    keycode, choice = ui.menu(
+        text=text,
+        height=height + 7,
+        menu_height=height,
+        width=width,
+        choices=choices,
+        cancel_label='Exit' if exit_button else 'Back',
+        default_item=default if default else choice
+      )
+    if keycode in (ui.DIALOG_CANCEL, ui.DIALOG_ESC):
+      return keycode
+    keycode = on_selection(
+      choice=items[int(choice) - 1][0],
+      title=items[int(choice) - 1][1])
+    if back:
+      return keycode
+    if exit_button and keycode == ui.DIALOG_ESC:
+      continue
+    if keycode == ui.DIALOG_ESC:
+      return keycode
+
+
+def ui_simple_menu(title, items, default=None, ok_button='OK', cancel_button='Back', middle_button=None, sort=False):
+  '''show a menu'''
+  # items = [(name, title), ...]
+  # default = one of items names
+  # return keycode, choice
+  if len(items) < 1:
+    text = '\Zb%s\Zn\n\n\nNothing found.' % title
+    height, width = ui_dimensions(text)
+    ui.msgbox(text, height=height, width=width)
+    return ui.DIALOG_CANCEL, None
+  if sort:
+    items.sort(key=lambda k: natural_order(k[1]))
+  text = '%s' % title
+  choices = [(str(i[0] + 1), i[1][1]) for i in enumerate(items)]
+  keys = [i[0] for i in items]
+  height = min(rows - 10, len(choices))
+  width = min(cols, max(max(len(x[1]) + 20 for x in choices), len(text)))
+  default = str(keys.index(default) + 1 if default else 1)
+  keycode, selection = ui.menu(
+      text=text,
+      height=height+7,
+      menu_height=height,
+      width=width,
+      choices=choices,
+      ok_label=ok_button,
+      cancel_label=cancel_button,
+      default_item=default,
+      extra_button=1 if middle_button else 0,
+      extra_label=middle_button if middle_button else '(error)'
+    )
+  selection = items[int(selection) - 1][0] if selection else None
+  return keycode, selection
+
+
+def ui_submenu(choice, title):
+  return choice(None, title)
+
+
+def ui_dimensions(text):
+  '''height,width of text'''
+  width = min(cols, max(len(l) - 1 for l in text.split('\n'))) + 5
+  height = sum(i if i else 1 for i in [len(textwrap.wrap(l, width + 1)) for l in text.split('\n')]) + 6
+  return height, width
+
+
+def ui_download(command, title, output, filename, streamname, duration, size, check_downloaded=True, use_queue=False):
+  '''download a steam with the given command. try to catch and report errors.'''
+  if os.path.exists(output):  # remove small files
+    if os.path.getsize(output) < 100000:
+      os.unlink(output)
+  if check_downloaded and filename in config.downloaded:
+    text = '\Z1You have already downloaded this file\Zn\n\n'
+    text += 'Filename: \Z4\Zb%s\Zn\n' % filename
+    if config.downloaded[filename]:
+      text += 'Downloaded: \Z4\Zb%s\Zn\n\n' % human_datetime(config.downloaded[filename])
+    text += '\nDownload it again?'
+    height, width = ui_dimensions(text)
+    keycode = ui.yesno(text, height=height, width=width, defaultno=True)
+    if keycode in (ui.DIALOG_CANCEL, ui.DIALOG_ESC):
+      return keycode
+  if config.debug:
+    r = raw_input('\n\nWill run command:\n\n%s\n\nPress any key to continue ' % ' '.join(command))
+  try:
+    job = subprocess.Popen(command, stderr=subprocess.PIPE, bufsize=-1)
+  except OSError:
+    app_error('cannot run command: %s' % ' '.join(command))
+  text = 'Downloading \Zb\Z4%s\Zn...' % title
+  width = len(text) + 10
+  text += '\n%s'
+  if size:
+    text += ' / ' + size
+  ui.gauge_start(text=text % '0', height=7, width=width)
+  percent_re = re.compile(r'\d+\.?\d%')
+  filesize_re = re.compile(r'\d+\.\d+ kB')
+  line = ''
+  while True:
+    char = job.stderr.read(1)
+    if not char:
+      break
+    if char != '\r':
+      line += char
+      continue
+    percent_match = percent_re.search(line)
+    if percent_match:
+      percent = int(float(percent_match.group(0)[:-1]))
+      filesize_match = filesize_re.search(line)
+      if filesize_match:
+        filesize = int(float(filesize_match.group(0)[:-3])) * 1024
+      else:
+        filesize = os.path.getsize(output)
+      ui.gauge_update(percent, text % bytes(filesize), update_text=1)
+    if any(e in line.lower() for e in ('error', 'already completed', "couldn't resume")):
+      break
+    line = ''
+  ui.gauge_stop()
+  if 'error' in line.lower() or "Couldn't resume" in line:
+    if os.path.exists(output):
+      os.unlink(output)
+    if 'StreamNotFound' in line or 'returned error: 404' in line:
+      text = '\Zb\Z1File not found on server: \ZB%s\Zn' % streamname
+      height, width = ui_dimensions(text)
+      ui.msgbox(text=text, height=height, width=width)
+      return ui.DIALOG_CANCEL
+    else:
+      text = '\Zb\Z1Error\Zn\n\n' + line
+      height, width = ui_dimensions(text)
+      ui.msgbox(text, height=height, width=width)
+      return ui.DIALOG_CANCEL
+  if 'Already Completed' in line:
+    text = '\Zb\Z1File already downloaded\Zn\n\n%s' % filename
+    height, width = ui_dimensions(text)
+    ui.msgbox(text, height=height, width=width)
+    return ui.DIALOG_CANCEL
+  return_code = job.poll()
+  if return_code not in [0, None] and config.debug:
+    r = raw_input('\n\nBad return code: %s\n\n%s\n\nPress any key to continue ' % (return_code, ' '.join(command)))
+  # log successful download
+  if filename not in config.downloaded:
+    config.downloaded[filename] = datetime.datetime.now()
+    try:
+      f = open(config.already_downloaded_file, 'a')
+      f.write('%s %s\n' % (filename, config.downloaded[filename].strftime('%Y-%m-%d %H:%M')))
+      f.close()
+    except IOError:
+      app_error('cannot log download to %s' % config.already_downloaded_file)
+  else:  # update downloaded date
+    config.downloaded[filename] = datetime.datetime.now()
+    f = open(config.already_downloaded_file, 'w')
+    for key in config.downloaded:
+      if config.downloaded[key]:
+        f.write('%s %s\n' % (key, config.downloaded[key].strftime('%Y-%m-%d %H:%M')))
+      else:
+        f.write('%s\n' % key)
+    f.close()
+  if use_queue:
+    return ui.DIALOG_OK
+  text = '\Zb%s\Zn\n\n' % title
+  text += 'Download finished.\n\n'
+  text += 'Filename: ' + filename + '\n'
+  text += 'Filesize: ' + bytes(os.path.getsize(output)) + '\n'
+  if duration:
+    text += 'Runtime:  ' + runtime(duration)
+  height, width = ui_dimensions(text)
+  return ui.msgbox(text, height=height, width=width)
+
+
+def ui_progress(text, percent):
+  '''show a progress meter'''
+  if not config.progress_running:
+    ui.gauge_start(text, height=6, width=60)
+    config.progress_running = True
+  ui.gauge_update(percent, text, update_text=1)
+
+
+def ui_progress_stop():
+  '''stop the progress meter'''
+  config.progress_running = False
+  ui.gauge_stop()
+
+
+def ui_search_terms(title):
+  '''get search terms'''
+  text = '\Zb%s\Zn\n\n' % title
+  text += config.search_help
+  height, width = ui_dimensions(text)
+  return ui.inputbox(text, height=height, width=width, init='')
+
+
+def main_menu():
+  '''main menu'''
+  default = None
+  while True:
+    items = ['ABC']
+    items += ['SBS']
+    if config.queue:
+      i = 'Queue (%d programme%s)' % (len(config.queue), 's' if len(config.queue) > 1 else '')
+      items += [i]
+      if default == 'queue': default = i
+    items += ['Options']
+    keycode, selection = ui_simple_menu(
+        title='\Zb\Z4%s\Zn' % app_name,
+        items=zip(items, items),
+        default=default,
+        cancel_button='Exit'
+      )
+    if keycode != ui.DIALOG_OK:
+      if config.queue:
+        t = 'is one programme' if len(config.queue) == 1 else 'are %d programmes' % len(config.queue)
+        text = '\Zb\Z4Download queue before quitting?\Zn\n\n'
+        text += 'There %s in the queue.\n\n' % t
+        text += 'The queue has been saved for later.'
+        height, width = ui_dimensions(text)
+        keycode = ui.yesno(
+            text,
+            height=height,
+            width=width,
+            defaultno=True,
+            yes_label='Download',
+            no_label='Quit'
+          )
+        if keycode == ui.DIALOG_OK:
+          queue_download(text_status=True)
+        return keycode
+      return keycode
+    if selection == 'ABC':
+      ui_submenu(abc_menu, selection)
+      default = selection
+    elif selection == 'SBS':
+      ui_submenu(sbs_menu, selection)
+      default = selection
+    elif selection == 'Options':
+      ui_submenu(options_menu, selection)
+      default = selection
+    else:
+      ui_submenu(queue_menu, 'Queue')
+      default = 'queue' if config.queue else None
+
+
+def options_menu(choice, title):
+  items = (
+      (automation_menu, 'Automation options'),
+      (queue_options_menu, 'Queue options'),
+      (sort_menu, 'Sort order for programme lists'),
+      (abc_about_menu, 'About ABC downloads'),
+    )
+  return ui_menus(title=title, items=items, on_selection=ui_submenu, sort=False)
+
+
+def sort_menu(choice, title):
+  items = (
+      ('date', 'Sort by date'), 
+      ('title', 'Sort by title')
+    )
+  keycode, selection = ui_simple_menu(
+      title='\Zb\Z4%s\Zn' % title,
+      items=items,
+      default=config.sort_order
+    )
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  config.sort_order = selection
+  config.rc.set('options', 'sort', config.sort_order)
+  update_config()
+  return ui.DIALOG_CANCEL
+
+
+def queue_options_menu(choice, title):
+  items = (
+      ('y', 'Enable queue'),
+      ('n', 'Disable queue'),
+    )
+  keycode, selection = ui_simple_menu(
+      title='\Zb\Z4%s\Zn' % title,
+      items=items,
+      default='y' if config.use_queue else 'n'
+    )
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  config.use_queue = selection == 'y'
+  config.rc.set('options', 'queue', str(config.use_queue))
+  update_config()
+  return ui.DIALOG_CANCEL
+
+
+def queue_menu(choice, title):
+  default = None
+  while True:
+    if len(config.queue) < 1:
+      return ui.DIALOG_CANCEL
+    items = [(str(i), m[0] + ': ' + m[2]['title']) for i, m in enumerate(config.queue)]
+    items.sort(key=lambda k: natural_order(k[1]))
+    items.insert(0, ('download_all', '\Z5Download all...\Zn'))
+    _title = '\Zb\Z4%s\Zn' % title
+    if config.automation_use_queue:
+      _title += ' (automation also downloads these)'
+    keycode, selection = ui_simple_menu(
+        title=_title,
+        items=items,
+        default=default,
+        middle_button='Remove',
+      )
+    if keycode == ui.DIALOG_ESC:
+      return keycode
+    elif keycode == ui.DIALOG_CANCEL:
+      return keycode
+    if selection == 'download_all':
+      if keycode != ui.DIALOG_OK: continue
+      queue_download()
+      continue
+    if keycode == ui.DIALOG_EXTRA:  # remove item
+      config.queue.pop(int(selection))
+      save_queue()
+      continue
+    # show programme
+    station = config.queue[int(selection)][0]
+    programme = config.queue[int(selection)][1]
+    if station == 'ABC':
+      if 'abc' not in globals():
+        abc_fetch_data(None, None)
+      if programme not in abc.all_programmes:
+        text = '\Zb\Z4' + config.queue[int(selection)][2]['title'] + '\Zn'
+        text += '\n\n\Zb\Z1This programme is no longer available from the ABC catalog.\Zn'
+        text += '\n\nYou might be able to download it from the filename:\n  '
+        text += config.queue[int(selection)][2]['filename']
+        text += '\n\n\Zb\Z1It has been removed from the dwnload queue.\Zn'
+        config.queue.pop(int(selection))
+        save_queue()
+        height, width = ui_dimensions(text)
+        ui.msgbox(text, height=height, width=width)
+        continue
+      abc_programme(programme, None)
+      continue
+    else:
+      if 'sbs' not in globals():
+        sbs_fetch_all()
+      if programme not in sbs.all_programmes:
+        text = '\Zb\Z4' + config.queue[int(selection)][2]['title'] + '\Zn'
+        text += '\n\n\Zb\Z1This programme is no longer available from SBS.\Zn'
+        text += '\n\n\Zb\Z1It has been removed from the dwnload queue.\Zn'
+        config.queue.pop(int(selection))
+        save_queue()
+        height, width = ui_dimensions(text)
+        ui.msgbox(text, height=height, width=width)
+        continue
+      sbs_programme(programme, None)
+
+
+def queue_download(text_status=False):
+  if [q for q in config.queue if q[0] == 'ABC']:
+    if 'abc' not in globals():
+      abc_fetch_data(None, None)
+  if [q for q in config.queue if q[0] == 'SBS']:
+    if 'sbs' not in globals():
+      sbs_fetch_all()
+  status = []
+  queue = config.queue[:]
+  for q in queue:
+    station = q[0]
+    key = q[1]
+    programme = q[2]
+    if station == 'ABC':
+      if key not in abc.all_programmes:
+        config.queue.remove(q)
+        save_queue()
+        status += [(station, programme['title'], '\Z1no longer available\Zn')]
+        continue
+      keycode = abc_download(q[1], check_downloaded=False, use_queue=True)
+    else:  # SBS
+      if key not in sbs.all_programmes:
+        config.queue.remove(q)
+        save_queue()
+        status += [(station, programme['title'], '\Z1no longer available\Zn')]
+        continue
+      smil = cElementTree.XML(http(config.sbs_url + programme['source'])[1])
+      bitrates = list((s.get('src'), (float(s.get('system-bitrate')))) for s in smil.findall('body/switch/video'))
+      bitrates.sort(key=lambda x:x[1] * -1)
+      flv = bitrates[0][0][:-4]
+      filename = os.path.basename(bitrates[0][0])  # highest quality
+      url = smil.find('head/meta').get('base')
+      keycode = sbs_download(filename, flv, url, programme, check_downloaded=False, use_queue=True)
+    if keycode == ui.DIALOG_CANCEL:
+      status += [(station, programme['title'], '\Z1could not download\Zn')]
+    else:
+      status += [(station, programme['title'], '\Z4download OK\Zn')]
+    config.queue.remove(q)
+    save_queue()
+  text = ''
+  for s in status:
+    text += '%s: %s: \Zb%s\n' % (s[0], s[1], s[2])
+  if text_status:
+    print
+    print
+    print re.sub(r'\\Z.', '', text)
+  else:
+    height, width = ui_dimensions(text)
+    ui.msgbox(text, height=height, width=width)
+
+
+def load_queue():
+  if os.path.exists(config.queue_file):
+    f = open(config.queue_file, 'rb')
+    config.queue = pickle.load(f)
+    f.close()
+
+
+def save_queue():
+  f = open(config.queue_file, 'wb')
+  pickle.dump(config.queue, f)
+  f.close()
+
+
+def add_to_queue(station, key, programme):
+  for q in config.queue:
+    if q[0] == station and q[1] == key: return
+  config.queue += [(station, key, programme)]
+  config.queue.sort(key=lambda k: natural_order(k[2]['title']))
+  config.queue.sort(key=lambda k: natural_order(k[0]))
+  save_queue()
+
+
+def abc_about_menu(choice, title):
+  if 'abc' not in globals():
+    abc_fetch_data(None, None)
+  text = '\ZnABC downloads are \Z4%s\Zn ' % ('metered' if abc.downloads_are_metered else 'unmetered')
+  text += 'via %s.\n\n' % abc.hosting_service
+  height, width = ui_dimensions(text)
+  return ui.msgbox(text, height=height, width=width)
+
+
+def abc_fetch_data(choice, title):
+  '''fetch data from abc and update last fetch date'''
+  global abc
+  #ui.infobox(text='Fetching \Z4\ZbABC\Zn data...', height=3)
+  ui_progress('Fetching \Z4\ZbABC\Zn data...', 0)
+  if 'abc' in globals():
+    del abc
+  abc = ABC()
+  config.rc.set('abc', 'last_fetch', datetime.datetime.now().strftime('%Y-%m-%d %H:%M'))
+  update_config()
+  ui_progress_stop()
+
+
+def abc_menu(choice, title):
+  '''main menu for ABC'''
+  if 'abc' not in globals():
+    abc_fetch_data(None, None)
+  items = (
+      (abc_new_since_fetch, 'New since last fetch'),
+      (abc_new_last_24_hours, 'New in the last 24 hours'),
+      (abc_all_programmes, 'Programmes'),
+      (abc_all_series, 'Series'),
+      (abc_all_categories, 'Categories'),
+      (abc_search, 'Search'),
+      (abc_download_from_filename, 'Download from filename'),
+      (abc_download_from_url, 'Download from URL'),
+      (abc_fetch_data, 'Refresh data from ABC'),
+    )
+  keycode = ui_menus(title=title, items=items, on_selection=ui_submenu, sort=False)
+
+
+def abc_all_series(choice, title):
+  items = [(s, abc.series[s]['title']) for s in abc.playlist['index']['series']]
+  return ui_menus(title=title, items=items, on_selection=abc_programmes)
+
+
+def abc_all_programmes(choice, title):
+  LASTFETCH = 1
+  YESTERDAY = 4
+  BOTH = 5
+  title += ' \Zn(by %s; new \Z%dsince last fetch\Zn, \Z%din past 24 hours\Zn, \Z%dboth\Zn)' % (
+      config.sort_order, LASTFETCH, YESTERDAY, BOTH)
+  programmes = abc.all_programmes
+  yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+  items = []
+  for p in abc_sort(programmes):
+    if abc.programme[p]['size']:  # no streaming
+      colour = ''
+      d = abc.programme[p]['added']
+      if yesterday < config.abc_last_fetch:
+        if d > yesterday: colour = YESTERDAY
+        if d > config.abc_last_fetch: colour = BOTH
+      else:
+        if d > config.abc_last_fetch: colour = LASTFETCH
+        if d > yesterday: colour = BOTH
+      if colour: colour = '\Z%d' % colour
+      items += [(p, colour + abc.programme[p]['title'] + '\Zn')]
+  return ui_menus(title=title, items=items, on_selection=abc_programme, sort=False)
+
+
+def abc_new_since_fetch(choice, title):
+  title += ' \Z4(sorted by %s)\Zn' % config.sort_order
+  programmes = [p for p in abc.all_programmes
+      if abc.programme[p]['added'] >= config.abc_last_fetch
+      and abc.programme[p]['size']  # don't want streaming
+    ]
+  items = [(p, abc.programme[p]['title']) for p in abc_sort(programmes)]
+  return ui_menus(title=title, items=items, on_selection=abc_programme, sort=False)
+
+
+def abc_new_last_24_hours(choice, title):
+  title += ' \Z4(sorted by %s)\Zn' % config.sort_order
+  yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+  programmes = [p for p in abc.all_programmes
+      if abc.programme[p]['added'] >= yesterday
+      and abc.programme[p]['size']  # don't want streaming
+    ]
+  items = [(p, abc.programme[p]['title']) for p in abc_sort(programmes)]
+  return ui_menus(title=title, items=items, on_selection=abc_programme, sort=False)
+
+
+def abc_all_categories(choice, title):
+  items = [(s, abc.category[s]['title']) for s in abc.category if not abc.category[s]['parent']]
+  return ui_menus(title=title, items=items, on_selection=abc_subcategory)
+
+
+def abc_subcategory(choice, title):
+  if abc.category[choice]['categories'] == []:
+    return abc_playlist(choice, title)
+  items = [(s, abc.category[s]['title']) for s in abc.category if abc.category[s]['parent'] == choice]
+  items.sort(key=lambda k: natural_order(k[1]))
+  items.insert(0, (choice, 'All series in this category'))
+  return ui_menus(title=title, items=items, on_selection=abc_playlist, sort=False)
+
+
+def abc_playlist(choice, title):
+  abc.get_playlist(choice)
+  items = [(s, abc.series[s]['title']) for s in abc.playlist[choice]['series']]
+  return ui_menus(title=title, items=items, on_selection=abc_programmes)
+
+
+def abc_programmes(choice, title):
+  programmes = abc.series[choice]['programmes']
+  if len(programmes) == 1:
+    return abc_programme(programmes[0], title)
+  title += ' \Z4(sorted by %s)\Zn' % config.sort_order
+  items = [(p, abc.programme[p]['title']) for p in abc_sort(programmes)]
+  return ui_menus(title=title, items=items, on_selection=abc_programme, sort=False)
+
+
+def abc_programme(choice, title):
+  p = abc.programme[choice]
+  text = '\Zb\Z4%s\Zn\n' % p['title']
+  if p['subtitle']:
+    text += p['subtitle'] + '\n'
+  text += '\n%s\n\n' % p['desc']
+  if not p['size']:
+    text += '\n\n\Z1This is live media stream. Watch it online:\Zn\n'
+    text += '  %s#/program/%s' % (config.abc_url, choice)
+    height, width = ui_dimensions(text)
+    keycode = ui.msgbox(text, height=height, width=width)
+    return keycode
+  text += '\n\ZbAdded:  \Zn %s' % human_datetime(p['added'])
+  text += '\n\ZbExpires:\Zn %s\n' % human_datetime(p['expires'])
+  if p['duration']:
+    text += '\ZbRuntime:\Zn %s\n' % runtime(p['duration'])
+  if p['rating']:
+    text += '\ZbRating: \Zn %s\n' % p['rating']
+  text += '\n\ZbFile path:\Zn %s\n' % p['filename']
+  text += '\ZbFile size:\Zn %s' % p['size']
+  if p['website']:
+    text += '\n\ZbWebsite:  \Zn %s\n' % p['website']
+  basefile = os.path.basename(p['filename'])
+  if basefile in config.downloaded:
+    text += '\n\n\Z1You have already downloaded this file\Zn'
+    if config.downloaded[basefile]:
+      text += ' on %s' % human_datetime(config.downloaded[basefile])
+    text += '.'
+  yes_label = 'Download'
+  if config.use_queue:
+    yes_label = 'Add to queue'
+    if choice in [q[1] for q in config.queue if q[0] == 'ABC']:
+      yes_label = 'OK'
+      text += '\n\n\ZbThis programme is already queued for downloading.\Z1'
+  height, width = ui_dimensions(text)
+  keycode = ui.yesno(
+      text,
+      height=height,
+      width=width,
+      defaultno=True,
+      yes_label=yes_label,
+      no_label='Back',
+    )
+  if keycode == ui.DIALOG_CANCEL: return keycode
+  if keycode == ui.DIALOG_ESC: return keycode
+  if yes_label == 'OK': return keycode
+  if config.use_queue:
+    add_to_queue('ABC', choice, abc.programme[choice])
+  else:
+    keycode = abc_download(choice, check_downloaded=False)
+  return keycode
+
+
+def abc_search(choice, title):
+  '''search menu'''
+  items = (
+      (abc_search_titles, 'Search titles'),
+      (abc_search_fulltext, 'Full text search'),
+      (abc_search_keywords, 'Search series keywords')
+    )
+  return ui_menus(title=title, items=items, on_selection=ui_submenu, sort=False)
+
+
+def abc_search_titles(choice, title):
+  keycode, terms = ui_search_terms(title)
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  if terms == '':
+    return ui.DIALOG_CANCEL
+  title = 'Title search for \Z4%s\Zn (sorted by %s)' % (terms, config.sort_order)
+  items = [(p, abc.programme[p]['title'])
+      for p in abc_sort(abc.all_programmes)
+      if fnmatch.fnmatch(abc.programme[p]['title'].lower(), '*%s*' % terms.lower())
+    ]
+  return ui_menus(title=title, items=items, on_selection=abc_programme, sort=False)
+
+
+def abc_search_keywords(choice, title):
+  keycode, terms = ui_search_terms(title)
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  if terms == '':
+    return ui.DIALOG_CANCEL
+  title = 'Series keyword search for \Z4%s\Zn (sorted by %s)' % (terms, config.sort_order)
+  items = [(s, abc.series[s]['title'])
+      for s in abc.playlist['index']['series']
+      if fnmatch.fnmatch(abc.series[s]['keywords'].lower(), '*%s*' % terms.lower())]
+  abc.playlist['search_results'] = dict(title=title, series=items)
+  keycode = ui_menus(title=title, items=items, on_selection=abc_programmes)
+  del abc.playlist['search_results']
+  return keycode
+
+
+def abc_search_fulltext(choice, title):
+  keycode, terms = ui_search_terms(title)
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  if terms == '':
+    return ui.DIALOG_CANCEL
+  title = 'Full-text search for \Z4%s\Zn (sorted by %s)' % (terms, config.sort_order)
+  items = [(p, abc.programme[p]['title'])
+      for p in abc_sort(abc.all_programmes)
+      if fnmatch.fnmatch(abc.programme[p]['title'].lower(), '*%s*' % terms.lower())
+      or fnmatch.fnmatch(abc.programme[p]['subtitle'].lower(), '*%s*' % terms.lower())
+      or fnmatch.fnmatch(abc.programme[p]['desc'].lower(), '*%s*' % terms.lower())
+    ]
+  return ui_menus(title=title, items=items, on_selection=abc_programme, sort=False)
+
+
+def abc_sort(programmes):
+  programmes.sort(key=lambda k: natural_order(abc.programme[k]['title']))
+  if config.sort_order == 'date':
+    programmes.sort(key=lambda k: abc.programme[k]['added'], reverse=True)
+  return programmes
+
+
+def abc_download_from_url(choice, title):
+  '''try downloading from a website URL'''
+  while True:
+    text = '\ZbEnter a URL from the abc web site\Zn'
+    text += '\nEg: \Zb\Z4http://www.abc.net.au/iview/#/view/679931\Zn'
+    height, width = ui_dimensions(text)
+    keycode, url = ui.inputbox(text, height=height, width=width, init='')
+    if keycode in (ui.DIALOG_CANCEL, ui.DIALOG_ESC):
+      return keycode
+    if url == '':
+      return ui.DIALOG_CANCEL
+    programme = url.split('/')[-1:][0]
+    if (not programme.isdigit()) or (not url.startswith('http://www.abc.net.au/iview/#/view/')):
+      text = 'Not a valid abc programme URL. Try again.'
+      height, width = ui_dimensions(text)
+      keycode = ui.msgbox(text, height=height, width=width)
+      if keycode == ui.DIALOG_ESC:
+        return keycode
+      continue
+    if programme not in abc.programme.keys():
+      text = 'Cannot find that programme (\Zb%s\Zn)' % programme
+      height, width = ui_dimensions(text)
+      keycode = ui.msgbox(text, height=height, width=width)
+      if keycode == ui.DIALOG_ESC:
+        return keycode
+      continue
+    keycode = abc_programme(programme, abc.programme[programme]['title'])
+    if keycode == ui.DIALOG_ESC:
+      return keycode
+
+
+def abc_download_from_filename(choice, title):
+  '''try downloading a file name'''
+  text = '\ZbEnter a filename\Zn\n'
+  text += 'Eg: \Zb\Z4news/730report_101111\Zn, \Zb\Z4addictedplastic_10_xx_xx\Zn\n'
+  text += 'Sometimes a programme is available even though it is not in the catalogue'
+  height, width = ui_dimensions(text)
+  while True:
+    keycode, filename = ui.inputbox(text, height=height, width=width, init='')
+    if keycode in (ui.DIALOG_CANCEL, ui.DIALOG_ESC):
+      return keycode
+    filename = filename.strip()
+    if filename == '':
+      return ui.DIALOG_CANCEL
+    if not filename.endswith('.mp4'):
+      filename = filename + '.mp4'
+    abc.programme['_'] = dict(title=filename, desc='', size='', filename=filename)
+    keycode = abc_download('_')
+    del abc.programme['_']
+    if keycode == ui.DIALOG_ESC:
+      return keycode
+
+
+def abc_download(pid, check_downloaded=True, use_queue=False):
+  '''download a programme from the ABC'''
+  p = abc.programme[pid]
+  title = p['title']
+  filename = os.path.basename(p['filename'])
+  output = os.path.join(config.download_dir, filename)
+  abc.get_auth()
+  command = [config.rtmpdump_cmd]  # build command
+  if abc.server_url:  # hostworks
+    command += ['--rtmp', '%s?auth=%s' % (abc.server_url, abc.token)]
+    command += ['--playpath', 'mp4:%s' % p['filename']]
+  else:  # akami
+    command += ['--rtmp', '%s////flash/playback/_definst_/%s' % (abc.streaming_url[:-9], p['filename'])]
+    command += ['--tcUrl', '%s?auth=%s' % (abc.streaming_url, abc.token)]
+  command += ['--swfVfy', abc.auth_swf]
+  command += ['-o', output]
+  command += ['--resume']
+  command += ['1>&2']
+  duration = p['duration'] if 'duration' in p else None
+  size = p['size'] if 'size' in p else None
+  streamname = p['filename']
+  return ui_download(
+      command,
+      title,
+      output,
+      filename,
+      streamname,
+      duration,
+      size,
+      check_downloaded=check_downloaded,
+      use_queue=use_queue
+    )
+
+
+def sbs_menu(choice, title):
+  '''main menu for SBS'''
+  global sbs
+  if 'sbs' not in globals():
+    sbs = SBS()
+  items = [(m, sbs.menu[m]['title']) for m in sbs.menu[sbs.root_menu]['menus']]
+  items.sort(key=lambda k: natural_order(k[1]))
+  items += [('search', 'Search')]
+  return ui_menus(title=title, items=items, on_selection=sbs_submenu, sort=False)
+
+
+def sbs_search(choice, title):
+  '''search menu'''
+  items = ((sbs_search_titles, 'Search titles'),
+      (sbs_search_fulltext, 'Full text search'))
+  return ui_menus(title=title, items=items, on_selection=ui_submenu, sort=False)
+
+
+def sbs_fetch_all():
+  global sbs
+  if 'sbs' not in globals():
+    sbs = SBS()
+  text='Fetching \Z4\ZbSBS\Zn data...'
+  max = len(sbs.menu)
+  for i, m in enumerate(sbs.menu):
+    if 'ui' in globals(): ui_progress(text, int(100.0 / max * (i + 1)))
+    if sbs.menu[m].has_key('playlist'):
+      sbs.get_playlist(sbs.menu[m]['playlist'])
+  if 'ui' in globals(): ui_progress_stop()
+
+
+def sbs_search_titles(choice, title):
+  keycode, terms = ui_search_terms(title)
+  if keycode in (ui.DIALOG_CANCEL, ui.DIALOG_ESC):
+   return keycode
+  if terms == '':
+    return ui.DIALOG_CANCEL
+  sbs_fetch_all()
+  programmes = []
+  for key in sbs.all_programmes:
+    if fnmatch.fnmatch(sbs.all_programmes[key]['title'].lower(), '*%s*' % terms):
+      programmes += [key]
+  sbs.playlist['search_results'] = programmes
+  title = 'Title search for \Z4%s\Zn (sorted by %s)' % (terms, config.sort_order)
+  items = [(p, sbs.all_programmes[p]['title']) for p in sbs.playlist['search_results']]
+  keycode = ui_menus(
+      title=title,
+      items=items,
+      on_selection=sbs_programme,
+      sort=config.sort_order=='title'
+    )
+  del sbs.playlist['search_results']
+  return keycode
+
+
+def sbs_search_fulltext(choice, title):
+  keycode, terms = ui_search_terms(title)
+  if keycode in (ui.DIALOG_CANCEL, ui.DIALOG_ESC):
+   return keycode
+  if terms == '':
+    return ui.DIALOG_CANCEL
+  sbs_fetch_all()
+  programmes = []
+  for key in sbs.all_programmes:
+    if fnmatch.fnmatch(sbs.all_programmes[key]['title'].lower(), '*%s*' % terms):
+      programmes += [key]
+    else:
+      if 'description' in sbs.all_programmes[key]:
+        if fnmatch.fnmatch(sbs.all_programmes[key]['description'].lower(), '*%s*' % terms):
+          programmes += [key]
+  sbs.playlist['search_results'] = programmes
+  title = 'Title search for \Z4%s\Zn (sorted by %s)' % (terms, config.sort_order)
+  items = [(p, sbs.all_programmes[p]['title']) for p in sbs.playlist['search_results']]
+  keycode = ui_menus(
+      title=title,
+      items=items,
+      on_selection=sbs_programme,
+      sort=config.sort_order=='title'
+    )
+  del sbs.playlist['search_results']
+  return keycode
+
+
+def sbs_submenu(choice, title):
+  if choice == 'search':
+    return sbs_search(choice, title)
+  items = [(m, sbs.menu[m]['title']) for m in sbs.menu[choice]['menus']]
+  if len(items) > 1:
+    return ui_menus(title=title, items=items, on_selection=sbs_submenu, sort=False)
+  if items:
+    choice = items[0][0]
+    #return ui_menus(title=title, items=items, on_selection=sbs_submenu, sort=False)
+  sbs.get_playlist(sbs.menu[choice]['playlist'])
+  title += ' \Z4(sorted by %s)\Zn' % config.sort_order
+  items = [(p['programme'], p['title']) for p in sbs.playlist[sbs.menu[choice]['playlist']]]
+  return ui_menus(title=title, items=items, on_selection=sbs_programme, sort=config.sort_order=='title')
+
+
+def sbs_programme(choice, title):
+  '''detail for an SBS programme'''
+  p = sbs.all_programmes[choice]
+  text = '\Zb\Z4%s\Zn\n' % p['title']
+  if p['description']:
+    text += '\n\n%s\n\n' % p['description']
+  if 'date' in p:
+    d = datetime.datetime.strftime(p['date'], '%A, ')
+    d += str(p['date'].day)  # Want 1 December not 01 December
+    d += datetime.datetime.strftime(p['date'], ' %B %Y at %I:%M%p')
+    text += '\n\ZbDate:  \Zn  %s\n' % d
+  if p['duration']:
+    text += '\ZbRuntime:\Zn %s\n' % runtime(p['duration'])
+  # check if we have already downloaded this one
+  smil = cElementTree.XML(http(config.sbs_url + p['source'])[1])
+  bitrates = list((s.get('src'), (float(s.get('system-bitrate')))) for s in smil.findall('body/switch/video'))
+  bitrates.sort(key=lambda x:x[1] * -1)
+  flv = bitrates[0][0][:-4]
+  filename = os.path.basename(bitrates[0][0])  # highest quality
+  url = smil.find('head/meta').get('base')
+  if filename in config.downloaded:
+    text += '\n\Z1You have already downloaded this file:\Zn'
+    text += '\nFilename: %s' % filename
+    if config.downloaded[filename]:
+      text += '\n\nDownloaded: %s' % human_datetime(config.downloaded[filename])
+  yes_label = 'Download'
+  if config.use_queue:
+    yes_label = 'Add to queue'
+    if choice in [q[1] for q in config.queue if q[0] == 'SBS']:
+      yes_label = 'OK'
+      text += '\n\n\ZbThis programme is already queued for downloading.\Z1'
+  height, width = ui_dimensions(text)
+  keycode = ui.yesno(
+      text,
+      height=height,
+      width=width,
+      defaultno=True,
+      yes_label=yes_label,
+      no_label='Back'
+    )
+  if keycode == ui.DIALOG_CANCEL:
+    return keycode
+  if keycode == ui.DIALOG_ESC:
+    return keycode
+  if yes_label == 'OK':
+    return keycode
+  if config.use_queue:
+    add_to_queue('SBS', choice, p)
+  else:
+    keycode = sbs_download(filename, flv, url, p)
+  return keycode
+
+
+def sbs_download(filename, flv, url, programme, check_downloaded=False, use_queue=False):
+  '''download a programme from SBS'''
+  output = os.path.join(config.download_dir, filename)
+  title = programme['title']
+  if url.startswith('http://'):
+    curl = which(config.curl_cmd)
+    wget = which(config.wget_cmd)
+    if not (curl or wget):
+      text = '\Zb\Z4Error:\Zn cannot download \Zb%s\Zn\n\n' % (url + filename)
+      text += 'Install \Zbcurl\Zn or \Zbwget\Zn and try again.'
+      height, width = ui_dimensions(text)
+      ui.msgbox(text, height=height, width=width)
+      return ui.DIALOG_CANCEL
+    if curl:
+      command = [curl]
+      command += ['-#']
+      command += ['--fail']
+      command += ['--show-error']
+      command += [url + filename]
+      command += ['-o', output]
+      command += ['1>&2']
+    else:  # wget
+      command = [wget]
+      command += ['--progress=bar:force']
+      command += [url + filename]
+      command += ['-O', output]
+      command += ['1>&2']
+  else:  # rtmpdump
+    command = [config.rtmpdump_cmd]  # build command
+    command += ['--rtmp', url]
+    command += ['--playpath', flv]
+    command += ['-o', output]
+    command += ['--resume']
+    command += ['1>&2']
+  duration = programme['duration'] if 'duration' in programme else None
+  return ui_download(
+      command,
+      title,
+      output,
+      filename,
+      filename,
+      duration,
+      None,
+      check_downloaded=check_downloaded,
+      use_queue=use_queue
+    )
+
+
+def automation_menu(choice, title):
+  items = (
+      (automation_rules, 'Edit rules'),
+      (automation_check, 'Check rules'),
+      (automation_download, 'Download now'),
+      (automation_use_queue, 'Use queue'),
+    )
+  return ui_menus(title=title, items=items, on_selection=ui_submenu, sort=False)
+
+
+def automation_rules(choice, title):
+  default = None
+  while True:
+    automation_load_rules()
+    items = [(rule, rule) for rule in config.automation_rules]
+    items.sort()
+    items.insert(0, ('__new_rule', '\Z5New rule\Zn'))
+    keycode, selection = ui_simple_menu(
+        title='\Zb\Z4%s\Zn' % title,
+        items=items
+      )
+    if keycode != ui.DIALOG_OK:
+      return keycode
+    if selection == '__new_rule':
+      keycode = automation_new_rule()
+    else:
+      keycode = automation_edit_rule(selection)
+    if keycode == ui.DIALOG_ESC:
+      return keycode
+
+
+def automation_new_rule():
+  text = '\ZbNew rule\Zn\n\n'
+  text += config.search_help
+  height, width = ui_dimensions(text)
+  keycode, rule = ui.inputbox(text, height=height, width=width, init='')
+  rule = rule.strip().lower()
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  if rule == '__new_rule':
+    return keycode
+  if rule:
+    if rule not in config.automation_rules:
+      config.automation_rules += [rule]
+  automation_save_rules()
+  return keycode
+
+
+def automation_edit_rule(rule):
+  text = '\ZbEdit rule\Zn\n\n'
+  text += config.search_help
+  text += '  Blank to delete.\n'
+  height, width = ui_dimensions(text)
+  keycode, new_rule = ui.inputbox(text, height=height, width=width, init=rule)
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  new_rule = new_rule.strip().lower()
+  config.automation_rules.remove(rule)
+  if new_rule:
+    config.automation_rules += [new_rule]
+  automation_save_rules()
+  return keycode
+
+
+def automation_check(choice, title):
+  automation_load_matches()
+  items = [(str(i), m[0] + ': ' + m[2]['title']) for i, m in enumerate(config.automation_matches)]
+  items.sort(key=lambda k: natural_order(k[1]))
+  default = None
+  while True:
+    keycode, selection = ui_simple_menu(
+        title='\Zb\Z4These programmes match the automation rules:\Zn',
+        items=items,
+        default=default
+      )
+    if keycode != ui.DIALOG_OK:
+      return keycode
+    default = selection
+    match = config.automation_matches[int(selection)]
+    if match[0] == 'ABC':
+      keycode = abc_programme(match[1], None)
+    else:
+      keycode = sbs_programme(match[1], None)
+    if keycode == ui.DIALOG_ESC:
+      return keycode
+
+
+def automation_load_matches():
+  global abc
+  global sbs
+  if 'ui' in globals():
+    abc_fetch_data(None, None)
+  else:
+    abc = ABC()
+  sbs_fetch_all()
+  config.automation_matches = []
+  for rule in config.automation_rules:
+    # ABC
+    for key in abc.all_programmes:
+      if fnmatch.fnmatch(abc.programme[key]['title'].lower(), '*%s*' % rule):
+        if os.path.basename(abc.programme[key]['filename']) not in config.downloaded.keys():
+          config.automation_matches += [('ABC', key, abc.programme[key])]
+    # SBS
+    for key in sbs.all_programmes:
+      if fnmatch.fnmatch(sbs.all_programmes[key]['title'].lower(), '*%s*' % rule):
+        smil = cElementTree.XML(http(config.sbs_url + sbs.all_programmes[key]['source'])[1])
+        bitrates = list((s.get('src'), (float(s.get('system-bitrate')))) for s in smil.findall('body/switch/video'))
+        bitrates.sort(key=lambda x:x[1] * -1)
+        filename = os.path.basename(bitrates[0][0])  # highest quality
+        if filename not in config.downloaded.keys():
+          config.automation_matches += [('SBS', key, sbs.all_programmes[key])]
+
+
+def automation_load_rules():
+  config.automation_rules = []
+  if not os.path.exists(config.automation_file):
+    return
+  f = open(config.automation_file, 'r')
+  rules = f.read()
+  f.close()
+  for line in rules.split('\n'):
+    if line:
+      config.automation_rules += [line]
+
+
+def automation_save_rules():
+  f = open(config.automation_file, 'w')
+  for rule in set(config.automation_rules):
+    if rule:
+      f.write(rule + '\n')
+  f.close()
+
+
+def automation_download(choice, title):
+  automation_load_matches()
+  if not config.automation_matches:
+    text = 'Nothing to download.'
+    height, width = ui_dimensions(text)
+    ui.msgbox(text, height=height, width=width)
+    return
+  status = []
+  for m in config.automation_matches:
+    station = m[0]
+    key = m[1]
+    programme = m[2]
+    if station == 'ABC':
+      keycode = abc_download(m[1], check_downloaded=False, use_queue=True)
+    else:  # SBS
+      smil = cElementTree.XML(http(config.sbs_url + programme['source'])[1])
+      bitrates = list((s.get('src'), (float(s.get('system-bitrate')))) for s in smil.findall('body/switch/video'))
+      bitrates.sort(key=lambda x:x[1] * -1)
+      flv = bitrates[0][0][:-4]
+      filename = os.path.basename(bitrates[0][0])  # highest quality
+      url = smil.find('head/meta').get('base')
+      keycode = sbs_download(filename, flv, url, programme, check_downloaded=False, use_queue=True)
+    if keycode == ui.DIALOG_CANCEL:
+      status += [(station, programme['title'], '\Z1could not download\Zn')]
+    else:
+      status += [(station, programme['title'], '\Z4download OK\Zn')]
+  text = ''
+  for s in status:
+    text += '%s: %s: \Zb%s\n' % (s[0], s[1], s[2])
+  height, width = ui_dimensions(text)
+  ui.msgbox(text, height=height, width=width)
+
+
+def automation_use_queue(choice, title):
+  items = (
+      ('y', 'Download queue when automation is run'),
+      ('n', 'Do not download queue when automation is run'),
+    )
+  keycode, selection = ui_simple_menu(
+      title='\Zb\Z4%s\Zn' % title,
+      items=items,
+      default='y' if config.automation_use_queue else 'n'
+    )
+  if keycode != ui.DIALOG_OK:
+    return keycode
+  config.automation_use_queue = selection == 'y'
+  config.rc.set('options', 'automation_downloads_queue', str(config.automation_use_queue))
+  update_config()
+  return ui.DIALOG_CANCEL
+
+
+def cron():
+  if config.debug: print 'loading data'
+  automation_load_matches()
+  log = []
+  matches = config.automation_matches
+  if config.automation_use_queue:
+    load_queue()
+    matches += config.queue
+    config.queue = []
+    save_queue()
+  for match in matches:
+    station, filename, error = cron_download(match)
+    title = match[2]['title']
+    message = 'Error: %s' % error if error else 'Downloaded OK'
+    log += [(station, title, filename, message)]
+    if config.debug:
+      print ':'.join([station, title, filename, message])
+    if config.cron_use_console:
+      print ':'.join([station, title, filename, message])
+    if config.cron_use_growl:
+      command = [which('growlnotify')]
+      command += ['-s']
+      command += ['-t', title]
+      command += ['-m', filename + '\n' + message]
+      job = subprocess.call(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  if config.automation_matches and config.cron_use_email:
+    body = ''
+    for station, title, filename, message in log:
+      body += ':'.join([station, title, filename, message]) + '\r\n'
+    script = '''\
+      tell application "Mail"
+        set theNewMessage to make new outgoing message with properties {subject:"autv report", content:"%s", visible:true}
+        tell theNewMessage
+          make new to recipient with properties {address:"%s"}
+          send
+        end tell
+      end tell
+    ''' % (body, config.cron_email_recipient)
+    command = ['osascript']
+    command += ['-e', script]
+    if len(log) > 0:
+      job = subprocess.call(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def cron_check():
+  automation_load_matches()
+  items = [m[0] + ': ' + m[2]['title'] for m in config.automation_matches]
+  items += [m[0] + ': ' + m[2]['title'] for m in config.queue]
+  items.sort(key=lambda k: natural_order(k[1]))
+  sys.stdout.write('\r')
+  if items:
+    for item in items:
+      print item
+  else:
+    print 'No programmes found.'
+
+
+def cron_download(match):
+  '''download a stream and be quiet about it'''
+  station = match[0]
+  programme = match[2]
+  if station == 'ABC':
+    filename = os.path.basename(programme['filename'])
+    output = os.path.join(config.download_dir, filename)
+    abc.get_auth()
+    command = [config.rtmpdump_cmd]  # build command
+    if abc.server_url:  # hostworks
+      command += ['--rtmp', '%s?auth=%s' % (abc.server_url, abc.token)]
+      command += ['--playpath', 'mp4:%s' % programme['filename']]
+    else:  # akami
+      command += ['--rtmp', '%s////flash/playback/_definst_/%s' % (abc.streaming_url[:-9], programme['filename'])]
+      command += ['--tcUrl', '%s?auth=%s' % (abc.streaming_url, abc.token)]
+    command += ['--swfVfy', abc.auth_swf]
+    command += ['-o', output]
+    command += ['--resume']
+    command += ['1>&2']
+  elif station == 'SBS':
+    smil = cElementTree.XML(http(config.sbs_url + programme['source'])[1])
+    bitrates = list((s.get('src'), (float(s.get('system-bitrate')))) for s in smil.findall('body/switch/video'))
+    bitrates.sort(key=lambda x:x[1] * -1)
+    flv = bitrates[0][0][:-4]
+    filename = os.path.basename(bitrates[0][0])  # highest quality
+    url = smil.find('head/meta').get('base')
+    output = os.path.join(config.download_dir, filename)
+    if url.startswith('http://'):
+      curl = which(config.curl_cmd)
+      wget = which(config.wget_cmd)
+      if not (curl or wget):
+        return station, filename, 'need curl or wget to download this file'
+      if curl:
+        command = [curl]
+        command += ['-#']
+        command += ['--fail']
+        command += ['--show-error']
+        command += [url + filename]
+        command += ['-o', output]
+        command += ['1>&2']
+      else:  # wget
+        command = [wget]
+        command += ['--progress=bar:force']
+        command += [url + filename]
+        command += ['-O', output]
+        command += ['1>&2']
+    else:  # rtmpdump
+      command = [config.rtmpdump_cmd]  # build command
+      command += ['--rtmp', url]
+      command += ['--playpath', flv]
+      command += ['-o', output]
+      command += ['--resume']
+      command += ['1>&2']
+  if os.path.exists(output):  # remove small files
+    if os.path.getsize(output) < 100000:
+      os.unlink(output)
+  if filename in config.downloaded:
+    return station, filename, 'already downloaded'
+  try:
+    job = subprocess.Popen(command, stderr=subprocess.PIPE, bufsize=-1)
+  except OSError:
+    return station, filename, 'could not run: %s' % ' '.join(command)
+  line = ''
+  while True:
+    char = job.stderr.read(1)
+    if not char:
+      break
+    if char != '\r':
+      line += char
+      continue
+    if any(e in line.lower() for e in ('error', 'already completed', "couldn't resume")):
+      break
+    line = ''
+  if 'error' in line.lower() or "Couldn't resume" in line:
+    if os.path.exists(output):
+      os.unlink(output)
+    if 'StreamNotFound' in line or 'returned error: 404' in line:
+      return station, filename, 'file not found on server'
+    else:
+      return station, filename, line
+  return_code = job.poll()
+  # log successful download (ignore the obvious race condition)
+  config.downloaded[filename] = datetime.datetime.now()
+  try:
+    f = open(config.already_downloaded_file, 'a')
+    f.write('%s %s\n' % (filename, config.downloaded[filename].strftime('%Y-%m-%d %H:%M')))
+    f.close()
+  except IOError:
+    return station, filename, 'cannot log to file %s' % config.already_downloaded_file
+  if 'Already Completed' in line:
+    return station, filename, 'file already downloaded'
+  return station, filename, ''
+
+
+# main
+app_init()
+if config.cron:
+  cron()
+elif config.cron_check:
+  cron_check()
+else:
+  ui_init()
+  main_menu()
+shutdown(None, None)

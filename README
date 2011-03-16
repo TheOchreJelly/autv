@@ -1,0 +1,8 @@
+Download programmes from the Australian TV web sites (only ABC and SBS so far).
+
+- Python 2.5 - 2.7
+- Linux or Mac
+- dialog command (brew install dialog on OS/X)
+- rtmpdump: rtmpdump.mplayerhq.hu
+- curl or wget for certain programmes on SBS
+
